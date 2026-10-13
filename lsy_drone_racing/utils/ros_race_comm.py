@@ -9,8 +9,11 @@ import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 logger = logging.getLogger(__name__)
+
+LATCHED = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
 class RaceCommNode:
@@ -31,22 +34,23 @@ class RaceCommNode:
         self.node = rclpy.create_node(name, parameter_overrides=[use_sim_time_parameter])
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self.node)
-
-        def _spin():
-            try:
-                self._executor.spin()
-            except ExternalShutdownException:
-                logger.debug(f"RaceCommNode '{name}' spin thread stopped")
-            except _rclpy.RCLError:
-                # Raised when the context is shut down while the thread is still spinning
-                logger.debug(f"RaceCommNode '{name}' spin thread stopped (context invalid)")
-
-        self._thread = threading.Thread(target=_spin, daemon=True, name=f"spin-{name}")
+        self._thread = threading.Thread(target=self._spin, daemon=True, name=f"spin-{name}")
         self._thread.start()
         logger.debug(f"RaceCommNode '{name}' started")
+
+    def _spin(self):
+        """Spin the ROS2 node in a background thread."""
+        try:
+            self._executor.spin()
+        except ExternalShutdownException:
+            logger.debug(f"'{self.node.get_name()}' spin thread stopped")
+        except _rclpy.RCLError:
+            # Raised when the context is shut down while the thread is still spinning
+            logger.debug(f"'{self.node.get_name()}' spin thread stopped (context invalid)")
 
     def close(self):
         """Shut down the executor and destroy the node."""
         self._executor.shutdown(timeout_sec=1.0)
         self.node.destroy_node()
+        self._thread.join(timeout=1.0)
         logger.debug("RaceCommNode closed")

@@ -1,13 +1,12 @@
-"""Deployment script for multi-drone racing clients (host-client architecture).
+"""Deployment script for multi-drone racing clients.
 
-Each client runs on a drone's computing unit and communicates with the central host
-via Zenoh. Run one instance per drone, specifying its rank.
+Clients run isolated and communicate with the race host via Zenoh. Make sure the host is up before
+starting your client.
 
 Usage:
 
-    python scripts/multi_deploy_client.py --config multi_level2.toml --drone_rank 0
-    python scripts/multi_deploy_client.py --config multi_level2.toml --drone_rank 1
-
+    pixi run -e deploy python scripts/multi_deploy_client.py --config multi_level2.toml --rank 0
+    pixi run -e deploy python scripts/multi_deploy_client.py --config multi_level2.toml --rank 1
 """
 
 from __future__ import annotations
@@ -29,51 +28,57 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def main(
-    config: str = "multi_level2.toml", controller: str | None = None, drone_rank: int | None = None
-):
+def configure_logging(rank: int):
+    """Configure logging for the client.
+
+    Args:
+        rank: Rank of this drone in the multi-drone setup.
+    """
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(f"[Rank {rank}][%(asctime)s.%(msecs)03d] %(message)s", "%H:%M:%S")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+def main(rank: int, config: str = "multi_level2.toml", controller: str | None = None):
     """Deploy and run a client for multi-drone racing.
 
     Args:
+        rank: Rank of this drone in the multi-drone setup.
         config: Configuration file name, assumed to be in ``config/``.
-        controller: Controller file name in ``lsy_drone_racing/control/``, or ``None``
-            to use the value from the config file.
-        drone_rank: Rank of this drone in the multi-drone setup. Required.
+        controller: Controller file name in ``lsy_drone_racing/control/``, or ``None`` to use the
+            value from the config file.
     """
-    assert drone_rank is not None, "drone_rank must be specified"
-
+    configure_logging(rank)
     rclpy.init()
     config_obj = load_config(Path(__file__).parents[1] / "config" / config)
     if controller is not None:
-        config_obj.controller[drone_rank]["file"] = controller
+        config_obj.controller[rank]["file"] = controller
     env: RealMultiDroneRaceEnvClient = gymnasium.make(
         "RealMultiDroneRaceEnvClient-v0",
         drones=config_obj.deploy.drones,
-        rank=drone_rank,
-        freq=config_obj.env.kwargs[drone_rank]["freq"],
+        rank=rank,
+        freq=config_obj.env.kwargs[rank]["freq"],
         track=config_obj.env.track,
         randomizations=config_obj.env.randomizations,
         dynamics=config_obj.sim.dynamics,
-        sensor_range=config_obj.env.kwargs[drone_rank]["sensor_range"],
-        control_mode=config_obj.env.kwargs[drone_rank]["control_mode"],
+        sensor_range=config_obj.env.kwargs[rank]["sensor_range"],
+        control_mode=config_obj.env.kwargs[rank]["control_mode"],
     )
     try:
         obs, info = env.reset(options=config_obj.deploy)
 
         control_path = Path(__file__).parents[1] / "lsy_drone_racing/control"
-        controller_cls = load_controller(control_path / config_obj.controller[drone_rank]["file"])
-        controller = controller_cls(obs, info, extract_config_for_rank(config_obj, drone_rank))
-        env.unwrapped.set_client_ready()
+        controller_cls = load_controller(control_path / config_obj.controller[rank]["file"])
+        controller = controller_cls(obs, info, extract_config_for_rank(config_obj, rank))
 
-        env.unwrapped.lock_until_race_start(timeout=120.0)
-        logger.info(
-            f"Client {drone_rank}: Starting control loop at "
-            f"{config_obj.env.kwargs[drone_rank]['freq']} Hz"
-        )
-        start_time = time.time()
+        env.unwrapped.wait_for_race_start(timeout=120.0)
+        logger.info("Started race")
+        start_time = time.perf_counter()
 
         while rclpy.ok():
-            t_loop = time.time()
+            t_loop = time.perf_counter()
             obs, info = env.unwrapped.obs(), env.unwrapped.info()
             action = controller.compute_control(obs, info)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -81,35 +86,24 @@ def main(
                 action, obs, reward, terminated, truncated, info
             )
             if terminated or truncated or controller_finished:
-                logger.debug(
-                    f"Client {drone_rank}: Episode finished "
-                    f"({terminated=}, "
-                    f"{truncated=}, "
-                    f"{controller_finished=})"
-                )
+                logger.debug(f"Race finished. {terminated=}, {truncated=}, {controller_finished=}")
                 break
-
-            dt = time.time() - t_loop
-            sleep_time = 1.0 / config_obj.env.kwargs[drone_rank]["freq"] - dt
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            if (dt := (time.perf_counter() - t_loop)) < (1 / config.env.kwargs[rank].freq):
+                time.sleep(1 / config.env.kwargs[rank].freq - dt)
             else:
-                logger.warning(
-                    f"Client {drone_rank}: Control loop overrun by {-sleep_time * 1000:.1f}ms"
-                )
+                exc = dt - 1 / config.env.kwargs[rank].freq
+                logger.warning(f"Controller execution time exceeded loop frequency by {exc:.3e}s.")
 
-        ep_time = time.time() - start_time
+        ep_time = time.perf_counter() - start_time
         finished = bool(info["finished_track"])
-        logger.info(
-            f"Client {drone_rank}: Episode completed in {ep_time:.3f}s "
-            f"(finished={finished}, gates_passed={info['n_gates_passed']})"
-        )
+        logger.info(f"Track time: {ep_time:.3f}s" if finished else "Task not completed")
+        logger.info(f"Number of gates passed: {info['n_gates_passed']}")
     except KeyboardInterrupt:
-        logger.info(f"Client {drone_rank}: Interrupted by user")
+        logger.info("Run aborted by user")
     finally:
         env.close()
         rclpy.shutdown()
-        logger.debug(f"Client {drone_rank}: Shutdown complete")
+        logger.debug("Shutdown complete")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-int32 drone_rank
+int32 rank
 float64[] action
 float64 elapsed_time
 float64 timestamp
