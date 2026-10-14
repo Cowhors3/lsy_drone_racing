@@ -24,18 +24,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Competition Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: competition
 
       - name: Checkout Clean Main Branch (For Anti-Cheat)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: fix/evaluation
           path: original_main
 
       - name: Checkout Student Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.sha }}
