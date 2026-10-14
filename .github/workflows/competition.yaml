@@ -31,7 +31,7 @@ jobs:
       - name: Checkout Clean Main Branch (For Anti-Cheat)
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: fix/evaluation
           path: original_main
 
       - name: Checkout Student Code
