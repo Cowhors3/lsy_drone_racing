@@ -462,11 +462,25 @@ class SuperController(Controller):
             direction -= (direction @ normal) * normal
             _length = float(np.linalg.norm(direction))
         choices = []
-        joint = self.passed == 3
-        for offset in (0.0, -0.06, 0.06):
-            crossing = centre + offset * self.rot[idx, :, 1]
+        optimize_time = self.passed in (2, 3) and self.gate_known[idx]
+        joint = self.passed == 3 or optimize_time
+        directions = [normal]
+        if optimize_time and self.passed == 3:
+            next_idx = self.sequence[self.passed + 1]
+            next_normal = self.rot[next_idx, :, 0] * self.directions[self.passed + 1]
+            outgoing = self.gates[next_idx] - 0.30 * next_normal - centre
+            lateral = outgoing - float(outgoing @ normal) * normal
+            lateral_norm = float(np.linalg.norm(lateral))
+            if lateral_norm > 0.10 and float(outgoing @ normal) > 0.10:
+                directions.append(normal + 0.35 * lateral / lateral_norm)
+        portals = [
+            (centre + offset * self.rot[idx, :, 1], direction)
+            for direction in directions
+            for offset in (0.0, -0.06, 0.06)
+        ]
+        for crossing, direction in portals:
             exits = [
-                crossing + distance * normal for distance in (0.24, 0.18, 0.32, 0.12, 0.10, 0.08)
+                crossing + distance * direction for distance in (0.24, 0.18, 0.32, 0.12, 0.10, 0.08)
             ]
             exits = [p for p in exits if self.clear_segments(crossing, p)]
             if not exits:
@@ -482,8 +496,10 @@ class SuperController(Controller):
                 else (0.30, 0.22, 0.16, 0.10, 0.40, 0.06, 0.04)
             )
             for approach in approaches:
-                before = crossing - approach * normal
+                before = crossing - approach * direction
                 if not self.clear_segments(before, crossing):
+                    continue
+                if direction is not normal and not self.clear_segments(before, after):
                     continue
                 route = self.plan_route(self.pos, before)
                 if not route:
@@ -534,6 +550,24 @@ class SuperController(Controller):
                 headings = delta / np.maximum(sizes[:, None], 1e-8)
                 turns = np.arccos(np.clip(np.sum(headings[:-1] * headings[1:], axis=1), -1.0, 1.0))
                 score = float(np.sum(sizes) + 0.50 * np.sum(turns))
+                if optimize_time:
+                    crossing_index = int(np.argmin(np.linalg.norm(self.path - crossing, axis=1)))
+                    # Estimate time on both sides of the opening with slower sharp turns.
+                    caps = np.full(len(sizes) + 1, 4.3)
+                    if len(turns):
+                        radius = np.minimum(sizes[:-1], sizes[1:]) / np.maximum(turns, 0.01)
+                        caps[1:-1] = np.clip(np.sqrt(6.0 * radius), 0.8, 4.3)
+                    caps[0] = min(caps[0], max(0.5, float(self.vel @ headings[0])))
+                    caps[crossing_index] = min(caps[crossing_index], self.passage_speed())
+                    for j in range(len(sizes) - 1, -1, -1):
+                        caps[j] = min(caps[j], np.sqrt(caps[j + 1] ** 2 + 8.0 * sizes[j]))
+                    for j, length in enumerate(sizes):
+                        caps[j + 1] = min(caps[j + 1], np.sqrt(caps[j] ** 2 + 8.0 * length))
+                    score = float(np.sum(2.0 * sizes / (caps[:-1] + caps[1:])))
+                    if not np.all(self.clear_segments(self.path[:-1], self.path[1:])):
+                        score += 10.0
+                    # Account for distance to the next gate even if the extension is blocked.
+                    score += np.linalg.norm(self.gates[next_idx] - self.path[-1]) / 1.5
                 names = (
                     "path",
                     "arc",
@@ -943,8 +977,9 @@ class SuperController(Controller):
             left, right = centre - original[j - 1], original[j + 1] - centre
             a, b = np.linalg.norm(left), np.linalg.norm(right)
             cut = min(0.45, 0.40 * a, 0.40 * b)
+            smooth_exit = self.planned_gate == 3 and np.linalg.norm(centre - self.exit_point) < 1e-5
             if (
-                np.min(np.linalg.norm(protected - centre, axis=1)) < 1e-5
+                (np.min(np.linalg.norm(protected - centre, axis=1)) < 1e-5 and not smooth_exit)
                 or self.planned_gate == 0
                 or cut < 0.025
             ):
@@ -953,6 +988,11 @@ class SuperController(Controller):
             before, after = centre - cut * left / a, centre + cut * right / b
             t = np.linspace(0.0, 1.0, 9)[:, None]
             curve = (1.0 - t) ** 2 * before + 2.0 * t * (1.0 - t) * centre + t**2 * after
+            if smooth_exit:
+                clearance = (curve - self.exit_centre) @ self.exit_normal
+                if np.min(clearance) < 0.13:
+                    points.append(centre)
+                    continue
             if np.all(self.clear_segments(curve[:-1], curve[1:], margin=0.04)):
                 points.extend(curve)
             else:
