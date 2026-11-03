@@ -122,7 +122,7 @@ class SuperController(Controller):
         direction[2] = 0.0
         direction /= max(float(np.linalg.norm(direction)), 1e-6)
         self.takeoff_direction = direction
-        self.takeoff = self.pos + 0.35 * direction + [0.0, 0.0, 0.26]
+        self.takeoff = self.pos + 0.35 * direction + [0.0, 0.0, 0.19]
         self.route = []
         self.index = 0
         self.planned_gate = -1
@@ -718,11 +718,11 @@ class SuperController(Controller):
         path_velocity = np.zeros(3)
         if self.phase == "takeoff":
             delta = self.takeoff - self.ref
-            self.ref += delta * min(1.0, 1.2 * self.dt / max(float(np.linalg.norm(delta)), 1e-8))
+            self.ref += delta * min(1.0, 1.8 * self.dt / max(float(np.linalg.norm(delta)), 1e-8))
             path_velocity = (
                 0.8 * self.takeoff_direction * float(np.clip((self.pos[2] - 0.05) / 0.10, 0.0, 1.0))
             )
-            path_velocity[2] = 1.0
+            path_velocity[2] = 1.35
             if self.pos[2] > self.takeoff[2] - 0.10:
                 self.plan_gate()
         else:
@@ -950,7 +950,7 @@ class SuperController(Controller):
         action = self._path_control(obs, info)
         nominal = np.array([11.4, 11.4, 35.7]) * (action[:3] - self.pos)
         nominal += np.array([5.7, 5.7, 14.3]) * (action[3:6] - self.vel) + self.force_bias
-        self.solution = np.tile(np.clip(nominal, [-7.0, -7.0, -3.0], [7.0, 7.0, 6.0]), self.horizon)
+        self.solution = np.tile(np.clip(nominal, [-8.5, -8.5, -3.8], [8.5, 8.5, 7.0]), self.horizon)
         return action
 
     def passage_speed(self) -> float:
@@ -967,13 +967,13 @@ class SuperController(Controller):
         outgoing /= max(float(np.linalg.norm(outgoing)), 1e-6)
         alignment = min(float(incoming @ normal), float(outgoing @ normal))
         smooth = float(np.clip((alignment - 0.15) / 0.75, 0.0, 1.0))
-        speed = 2.0 + (2.9 - 2.0) * smooth
+        speed = 2.3 + (3.35 - 2.3) * smooth
         if self.planned_gate == len(self.sequence) - 1:
-            speed = 2.9
+            speed = 3.15
         if self.planned_gate + 1 < len(self.sequence):
             following = self.gates[self.sequence[self.planned_gate + 1]] - self.exit_centre
             if float(normal @ following) < -0.1:
-                speed = 1.45
+                speed = 1.60
         if not self.gate_known[gate]:
             speed = min(speed, 1.8)
         return speed
@@ -992,7 +992,7 @@ class SuperController(Controller):
             a, b = np.linalg.norm(left), np.linalg.norm(right)
             cut = min(0.45, 0.40 * a, 0.40 * b)
             smooth_exit = (
-                self.planned_gate in (1, 3) and np.linalg.norm(centre - self.exit_point) < 1e-5
+                self.planned_gate in (1, 2, 3) and np.linalg.norm(centre - self.exit_point) < 1e-5
             )
             if (
                 (np.min(np.linalg.norm(protected - centre, axis=1)) < 1e-5 and not smooth_exit)
@@ -1056,7 +1056,7 @@ class SuperController(Controller):
         curvature = np.r_[
             0.0, 2.0 * np.linalg.norm(np.cross(u, v), axis=1) / np.maximum(denominator, 1e-8), 0.0
         ]
-        limit = np.minimum(4.3, np.sqrt(24.0 / np.maximum(curvature, 0.001)))
+        limit = np.minimum(5.2, np.sqrt(32.0 / np.maximum(curvature, 0.001)))
         limit = np.maximum(limit, 1.3)
         near = np.abs(sample - self.cross_arc) < 0.12
         limit[near] = np.minimum(limit[near], self.passage_speed())
@@ -1067,17 +1067,17 @@ class SuperController(Controller):
             )
             outgoing = self.gates[self.sequence[self.planned_gate + 1]] - self.exit_centre
             if float(normal @ outgoing) < -0.10:
-                limit[near] = np.minimum(limit[near], 1.45)
+                limit[near] = np.minimum(limit[near], 1.60)
         if rounded_second_exit and not self.gate_known[self.sequence[2]]:
             exit_index = int(np.argmin(np.linalg.norm(xyz - self.exit_point, axis=1)))
             limit[exit_index] = min(limit[exit_index], 1.5)
         for j in range(len(sample) - 2, -1, -1):
             limit[j] = min(
-                limit[j], np.sqrt(limit[j + 1] ** 2 + 2.0 * 5.0 * (sample[j + 1] - sample[j]))
+                limit[j], np.sqrt(limit[j + 1] ** 2 + 2.0 * 6.0 * (sample[j + 1] - sample[j]))
             )
         for j in range(1, len(sample)):
             limit[j] = min(
-                limit[j], np.sqrt(limit[j - 1] ** 2 + 2.0 * 5.0 * (sample[j] - sample[j - 1]))
+                limit[j], np.sqrt(limit[j - 1] ** 2 + 2.0 * 6.0 * (sample[j] - sample[j - 1]))
             )
         self.speed_arc, self.speed_limit = sample, limit
         self.speed_path = self.path
@@ -1200,14 +1200,14 @@ class SuperController(Controller):
             self.speed_since = self.tick
         known = self.gate_known[self.sequence[self.planned_gate]]
         recovering = self.recovery_goal is not None
-        cruise = 1.0 if recovering else 4.8
+        cruise = 1.0 if recovering else 5.30
         if (
             not known
             and np.linalg.norm(self.pos - self.gates[self.sequence[self.planned_gate]]) < 1.1
         ):
-            cruise = min(cruise, 2.3)
+            cruise = min(cruise, 2.50)
         if self.planned_gate == 0:
-            cruise = min(cruise, 2.1)
+            cruise = min(cruise, 2.35)
         starting_speed = max(1.1, float(np.linalg.norm(self.vel)))
         gate = self.sequence[self.planned_gate]
         normal = self.rot[gate, :, 0] * self.directions[self.planned_gate]
@@ -1215,7 +1215,7 @@ class SuperController(Controller):
         if self.planned_gate + 1 < len(self.sequence):
             outgoing = self.gates[self.sequence[self.planned_gate + 1]] - self.gates[gate]
             if float(normal @ outgoing) < -0.10:
-                gate_speed = 1.45
+                gate_speed = 1.60
         else:
             gate_speed = self.passage_speed()
         samples = []
@@ -1228,6 +1228,11 @@ class SuperController(Controller):
             forecast_cap = (
                 starting_speed
                 + 0.5
+                + (
+                    0.0
+                    if recovering or self.planned_gate == 0
+                    else (0.30 if self.planned_gate == 3 else 1.1)
+                )
                 + (1.5 if self.planned_gate == len(self.sequence) - 1 else 0.0)
                 * forecast_step
                 * self.h
@@ -1280,8 +1285,13 @@ class SuperController(Controller):
         difference = np.eye(3 * self.horizon) - np.eye(3 * self.horizon, k=-3)
         self.H = self.P.T @ (self.Q[:, None] * self.P) + 4.0 * self.V.T @ self.V
         self.H += 0.03 * np.eye(3 * self.horizon) + 0.03 * difference.T @ difference
+        lateral_axis = self.rot[gate, :, 1]
+        lateral_map = np.einsum("i,nij->nj", lateral_axis, self.G[:, :3])
+        lateral_weight = 200.0 * np.exp(-((distance / 0.40) ** 2))
+        self.H += lateral_map.T @ (lateral_weight[:, None] * lateral_map)
         self.cost_scale = float(np.mean(np.diag(self.H)))
         gradient = self.P.T @ (self.Q * (free[:, :3] - points).ravel())
+        gradient += lateral_map.T @ (lateral_weight * ((free[:, :3] - points) @ lateral_axis))
         gradient += 4.0 * self.V.T @ (free[:, 3:6] - target_velocity).ravel()
         gradient[:3] -= 0.03 * self.solution[:3]
         rows, bounds = [], []
@@ -1341,8 +1351,8 @@ class SuperController(Controller):
         weight = 50000.0 * norm**2 / self.cost_scale
         obstacle_count = len(bound)
         matrix = np.vstack((matrix, np.eye(3 * self.horizon)))
-        low = np.r_[bound, np.tile([-7.0, -7.0, -3.0], self.horizon)]
-        high = np.r_[np.full(obstacle_count, np.inf), np.tile([7.0, 7.0, 6.0], self.horizon)]
+        low = np.r_[bound, np.tile([-8.5, -8.5, -3.8], self.horizon)]
+        high = np.r_[np.full(obstacle_count, np.inf), np.tile([8.5, 8.5, 7.0], self.horizon)]
         rho = 1.0
         hessian = 2.0 * self.H / self.cost_scale
         factor = cho_factor(
@@ -1379,8 +1389,8 @@ class SuperController(Controller):
             dual += rho * (projected - z)
         self.solution = np.clip(
             solution,
-            np.tile([-7.0, -7.0, -3.0], self.horizon),
-            np.tile([7.0, 7.0, 6.0], self.horizon),
+            np.tile([-8.5, -8.5, -3.8], self.horizon),
+            np.tile([8.5, 8.5, 7.0], self.horizon),
         )
         control = self.solution[:3].copy()
         gate = self.sequence[self.planned_gate]
@@ -1420,7 +1430,7 @@ class SuperController(Controller):
                 outgoing = self.gates[next_gate] - 0.45 * next_normal - self.gates[gate]
                 reverse = float(outgoing @ rotation[:, 0]) * direction < -0.10
             if reverse:
-                crossing_speed = 0.70
+                crossing_speed = 0.90
                 if side > 0.0:
                     exit_distance = (
                         float((self.exit_point - self.exit_centre) @ rotation[:, 0]) * direction
@@ -1439,7 +1449,7 @@ class SuperController(Controller):
                     -28.0 * tracking[2] - 10.3 * velocity_local[2] - 0.52 * acceleration_local[2],
                 ]
             )
-            control = np.clip(rotation @ local_control, [-7.0, -7.0, -3.0], [7.0, 7.0, 6.0])
+            control = np.clip(rotation @ local_control, [-8.5, -8.5, -3.8], [8.5, 8.5, 7.0])
         self.solution[:3] = control
         self.model_old_u = control.copy()
         command = self.pos + (self.solution[:3] - self.force_bias) / kp
