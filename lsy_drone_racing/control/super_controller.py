@@ -356,7 +356,20 @@ class SuperController(Controller):
             parallel_clear = np.any(~moving & (np.abs(point) > half), axis=-1)
             enter = np.maximum(np.max(low, axis=-1), 0.0)
             leave = np.minimum(np.min(high, axis=-1), 1.0)
-            clear &= np.all(parallel_clear | (enter > leave), axis=-1)
+            separated = parallel_clear | (enter > leave)
+            if (
+                self.passed > 0
+                and gate_id == self.sequence[self.passed - 1]
+                and self.closed_gate(gate_id)
+                and getattr(self, "future_gate", None) != gate_id
+            ):
+                direction = self.directions[self.passed - 1]
+                start_side = direction * local[..., 0]
+                end_side = start_side + direction * delta[..., 0, 0]
+                separated[..., -1] |= (
+                    (start_side >= 0.06) & (end_side > start_side) & (end_side > half[-1, 0] + 0.01)
+                )
+            clear &= np.all(separated, axis=-1)
         clear &= np.all((b >= [-2.35, -1.35, 0.12]) & (b <= [2.35, 1.35, 1.85]), axis=-1)
         return clear
 
@@ -971,13 +984,16 @@ class SuperController(Controller):
         entry = self.point_at(self.entry_arc)
         crossing = self.point_at(self.cross_arc)
         protected = np.array([crossing, self.exit_point])
+        rounded_second_exit = False
         points = [original[0]]
         for j in range(1, len(original) - 1):
             centre = original[j]
             left, right = centre - original[j - 1], original[j + 1] - centre
             a, b = np.linalg.norm(left), np.linalg.norm(right)
             cut = min(0.45, 0.40 * a, 0.40 * b)
-            smooth_exit = self.planned_gate == 3 and np.linalg.norm(centre - self.exit_point) < 1e-5
+            smooth_exit = (
+                self.planned_gate in (1, 3) and np.linalg.norm(centre - self.exit_point) < 1e-5
+            )
             if (
                 (np.min(np.linalg.norm(protected - centre, axis=1)) < 1e-5 and not smooth_exit)
                 or self.planned_gate == 0
@@ -993,8 +1009,32 @@ class SuperController(Controller):
                 if np.min(clearance) < 0.13:
                     points.append(centre)
                     continue
+            if smooth_exit and self.planned_gate == 1:
+                # Leave extra tracking room on the curve and immediately after it.
+                lookahead = centre + min(0.55, b) * right / b
+                swept = np.vstack((curve, lookahead))
+                starts = swept[:-1, :2]
+                delta = np.diff(swept[:, :2], axis=0)
+                offset = self.obstacles[:, None, :2] - starts
+                closest = np.clip(
+                    np.sum(offset * delta, axis=2) / np.maximum(np.sum(delta**2, axis=1), 1e-10),
+                    0.0,
+                    1.0,
+                )
+                separation = np.linalg.norm(offset - closest[..., None] * delta, axis=2)
+                radii = np.array(
+                    [
+                        self.obstacle_radius(pole, known)
+                        for pole, known in zip(self.obstacles, self.obstacle_known)
+                    ]
+                )
+                room = float(np.min(separation - radii[:, None], initial=np.inf))
+                if room < 0.04 or float(right @ self.exit_normal) < 0.05 * b:
+                    points.append(centre)
+                    continue
             if np.all(self.clear_segments(curve[:-1], curve[1:], margin=0.04)):
                 points.extend(curve)
+                rounded_second_exit |= smooth_exit and self.planned_gate == 1
             else:
                 points.append(centre)
         points.append(original[-1])
@@ -1028,6 +1068,9 @@ class SuperController(Controller):
             outgoing = self.gates[self.sequence[self.planned_gate + 1]] - self.exit_centre
             if float(normal @ outgoing) < -0.10:
                 limit[near] = np.minimum(limit[near], 1.45)
+        if rounded_second_exit and not self.gate_known[self.sequence[2]]:
+            exit_index = int(np.argmin(np.linalg.norm(xyz - self.exit_point, axis=1)))
+            limit[exit_index] = min(limit[exit_index], 1.5)
         for j in range(len(sample) - 2, -1, -1):
             limit[j] = min(
                 limit[j], np.sqrt(limit[j + 1] ** 2 + 2.0 * 5.0 * (sample[j + 1] - sample[j]))
