@@ -341,7 +341,7 @@ class XJIRacerAggro(Controller):
     T_BLEND = 0.12
     FADE = 0.8
     D_START_MIN = 0.3
-    D_APP = 0.48
+    D_APP = (0.44, 0.48, 0.48, 0.48, 0.48)
     V_APP = (2.6, 3.0, 2.8, 2.8, 9.0)
     V_FINAL = 9.0
     R_PATH = 0.2
@@ -578,7 +578,11 @@ class XJIRacerAggro(Controller):
             if not self.g_seen[g]:
                 cap = self.V_APP[k]
             if cap is not None:
-                m = (path.s > s_c[k] - self.D_APP) & (path.s <= s_c[k] + 0.05) & (path.s >= prev_s)
+                m = (
+                    (path.s > s_c[k] - self.D_APP[k])
+                    & (path.s <= s_c[k] + 0.05)
+                    & (path.s >= prev_s)
+                )
                 caps[m] = np.minimum(caps[m], cap)
             prev_s = s_c[k]
         v_start = float(np.dot(v0, path.T[0])) if np.linalg.norm(v0) > 0 else 0.0
