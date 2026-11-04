@@ -6,10 +6,11 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
-from lsy_drone_racing.control import Controller
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
+
+from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -21,13 +22,7 @@ EZ = np.array([0.0, 0.0, 1.0])
 
 
 def _quintic(
-    b0: NDArray,
-    v0: NDArray,
-    a0: NDArray,
-    b1: NDArray,
-    v1: NDArray,
-    a1: NDArray,
-    T: float,
+    b0: NDArray, v0: NDArray, a0: NDArray, b1: NDArray, v1: NDArray, a1: NDArray, T: float
 ) -> NDArray:
     b0, v0, a0, b1, v1, a1 = (np.asarray(x, float) for x in (b0, v0, a0, b1, v1, a1))
     c0, c1, c2 = (b0, v0, a0 / 2)
@@ -124,15 +119,7 @@ H_Z = (
 
 class _PreviewMPC:
     def __init__(
-        self,
-        h: tuple,
-        n: int,
-        dt: float,
-        qp: float,
-        qv: float,
-        ru: float,
-        rdu: float,
-        m_hist: int,
+        self, h: tuple, n: int, dt: float, qp: float, qv: float, ru: float, rdu: float, m_hist: int
     ):
         h = np.asarray(h, float)
         M = m_hist
@@ -176,9 +163,7 @@ class _PreviewMPC:
     ) -> float:
         fp = p + self.j_dt * v + self.Pp @ up + self.cp1 * b
         fv = v + self.Pv @ up + self.cv1 * b
-        return (
-            self.ap @ (rp - fp) + self.av @ (rv - fv) + self.ar @ ra + self.ad * ulast
-        )
+        return self.ap @ (rp - fp) + self.av @ (rv - fv) + self.ar @ ra + self.ad * ulast
 
 
 class _Path:
@@ -240,13 +225,9 @@ class _Path:
                         r = np.linalg.norm(d, axis=1)
                         m = r < r_pole
                         if m.any():
-                            Ps[m, :2] = (
-                                q[:2] + d[m] / np.maximum(r[m], 1e-06)[:, None] * r_pole
-                            )
+                            Ps[m, :2] = q[:2] + d[m] / np.maximum(r[m], 1e-06)[:, None] * r_pole
                 Pe = np.r_[Ps[0] - ext[::-1] * tan[0], Ps, Ps[-1] + ext * tan[-1]]
-                Ps = gaussian_filter1d(Pe, sig_it / ds, axis=0, mode="nearest")[
-                    n_e:-n_e
-                ]
+                Ps = gaussian_filter1d(Pe, sig_it / ds, axis=0, mode="nearest")[n_e:-n_e]
             if t0 is not None:
                 w = (1.0 - _smooth5(sg / fade)[0])[:, None]
                 t_s = (Ps[1] - Ps[0]) / max(np.linalg.norm(Ps[1] - Ps[0]), 1e-09)
@@ -280,24 +261,18 @@ class _Path:
 
 
 class _Plan:
-    def __init__(
-        self, path: _Path, t0: float, dt: float, S: NDArray, SD: NDArray, SDD: NDArray
-    ):
+    def __init__(self, path: _Path, t0: float, dt: float, S: NDArray, SD: NDArray, SDD: NDArray):
         self.path, self.t0, self.dt = (path, t0, dt)
         self.S, self.SD, self.SDD = (S, SD, SDD)
 
     def eval(self, t: NDArray) -> tuple[NDArray, NDArray, NDArray]:
-        f = np.clip(
-            (np.asarray(t, float) - self.t0) / self.dt, 0, len(self.S) - 1.000001
-        )
+        f = np.clip((np.asarray(t, float) - self.t0) / self.dt, 0, len(self.S) - 1.000001)
         i = f.astype(int)
         w = f - i
         s = self.S[i] * (1 - w) + self.S[i + 1] * w
         sd = self.SD[i] * (1 - w) + self.SD[i + 1] * w
         sdd = self.SDD[i] * (1 - w) + self.SDD[i + 1] * w
-        late = np.maximum(
-            np.asarray(t, float) - (self.t0 + self.dt * (len(self.S) - 1)), 0.0
-        )
+        late = np.maximum(np.asarray(t, float) - (self.t0 + self.dt * (len(self.S) - 1)), 0.0)
         s = s + late * self.SD[-1]
         P, T, KV = self.path.at(s)
         return (P, T * sd[..., None], KV * (sd**2)[..., None] + T * sdd[..., None])
@@ -429,9 +404,7 @@ class XJIRacer(Controller):
         p0 = np.asarray(obs["pos"], float)
         self.p_start = p0.copy()
         self.ri = 0
-        self.base = self._make_plan(
-            p0, np.zeros(3), np.zeros(3), self.T_START, first=True
-        )
+        self.base = self._make_plan(p0, np.zeros(3), np.zeros(3), self.T_START, first=True)
         self._update_yaw_target(0.0)
         self.u_hist = np.zeros((self.MPC_M, 3))
         self.bias = np.zeros(3)
@@ -562,9 +535,7 @@ class XJIRacer(Controller):
                 i = int(np.argmin(dist))
                 if dist[i] < self.R_PATH - 0.01 and 0.1 < path.s[i] < path.L - 0.05:
                     q = path.P[i].copy()
-                    q[:2] = self.opos[j, :2] + d[i] / max(dist[i], 1e-06) * (
-                        self.R_PATH + 0.02
-                    )
+                    q[:2] = self.opos[j, :2] + d[i] / max(dist[i], 1e-06) * (self.R_PATH + 0.02)
                     kn = np.searchsorted(path.s_knots, path.s[i])
                     orig = path.knot_idx[min(kn, len(path.knot_idx) - 1)]
                     pts = np.insert(pts, orig, q, axis=0)
@@ -586,11 +557,7 @@ class XJIRacer(Controller):
             if not self.g_seen[g]:
                 cap = self.V_APP[k]
             if cap is not None:
-                m = (
-                    (path.s > s_c[k] - self.D_APP)
-                    & (path.s <= s_c[k] + 0.05)
-                    & (path.s >= prev_s)
-                )
+                m = (path.s > s_c[k] - self.D_APP) & (path.s <= s_c[k] + 0.05) & (path.s >= prev_s)
                 caps[m] = np.minimum(caps[m], cap)
             prev_s = s_c[k]
         v_start = float(np.dot(v0, path.T[0])) if np.linalg.norm(v0) > 0 else 0.0
@@ -610,9 +577,7 @@ class XJIRacer(Controller):
                 caps[m] = np.minimum(caps[m], 0.93 * v[m])
         return plan
 
-    def _time_law(
-        self, path: _Path, v: NDArray, v_start: float, a0: NDArray, t0: float
-    ) -> _Plan:
+    def _time_law(self, path: _Path, v: NDArray, v_start: float, a0: NDArray, t0: float) -> _Plan:
         ds = np.diff(path.s)
         dt_seg = 2 * ds / np.maximum(v[1:] + v[:-1], 0.05)
         t_s = np.r_[0.0, np.cumsum(dt_seg)]
@@ -693,9 +658,7 @@ class XJIRacer(Controller):
         v[0] = v0
         for i in range(n - 1):
             amax, _ = a_bounds(i, v[i])
-            v[i + 1] = min(
-                vlim[i + 1], math.sqrt(v[i] * v[i] + 2 * max(amax, 0.3) * ds)
-            )
+            v[i + 1] = min(vlim[i + 1], math.sqrt(v[i] * v[i] + 2 * max(amax, 0.3) * ds))
         for i in range(n - 2, 0, -1):
             _, dmax = a_bounds(i + 1, v[i + 1])
             v[i] = min(v[i], math.sqrt(v[i + 1] * v[i + 1] + 2 * max(dmax, 0.3) * ds))
@@ -710,9 +673,7 @@ class XJIRacer(Controller):
             out.append((i, self._aim(k), n, dp))
         return out
 
-    def _corr_eval(
-        self, corr: tuple | None, t: NDArray
-    ) -> tuple[NDArray, NDArray, NDArray]:
+    def _corr_eval(self, corr: tuple | None, t: NDArray) -> tuple[NDArray, NDArray, NDArray]:
         t = np.asarray(t, float)
         z = np.zeros(t.shape + (3,))
         if corr is None:
@@ -738,9 +699,7 @@ class XJIRacer(Controller):
     def _replan(self, t: float):
         P, V, A = self._ref(np.array([t]))
         c = self.corr
-        old = _SumRef(
-            self.base, (lambda tt: self._corr_eval(c, tt)) if c is not None else None
-        )
+        old = _SumRef(self.base, (lambda tt: self._corr_eval(c, tt)) if c is not None else None)
         plan = self._make_plan(P[0], V[0], A[0], t)
         self.base = _BlendRef(old, plan, t, self.T_BLEND)
         self.corr = None
@@ -773,11 +732,7 @@ class XJIRacer(Controller):
         d = -(e - e @ n * n)
         cp, cv, ca = self._corr_eval(self.corr, np.array([t]))
         cp, cv, ca = (cp[0], cv[0], ca[0])
-        t0 = (
-            t + self.CORR_DELAY
-            if np.linalg.norm(cv) + np.linalg.norm(ca) < 1e-06
-            else t
-        )
+        t0 = t + self.CORR_DELAY if np.linalg.norm(cv) + np.linalg.norm(ca) < 1e-06 else t
         T = max(tg - t0 - self.CORR_EARLY, self.CORR_TMIN)
         D = cp + self.CORR_GAIN * d
         v_end = self.CORR_LAMBDA * (D - cp) / T
@@ -842,9 +797,7 @@ class XJIRacer(Controller):
                     self._correct_gate(t, k, obs)
             self._update_yaw_target(t)
         pos, vel = (np.asarray(obs["pos"], float), np.asarray(obs["vel"], float))
-        a_now = (
-            (vel - self.v_prev) * self.freq if self.v_prev is not None else np.zeros(3)
-        )
+        a_now = (vel - self.v_prev) * self.freq if self.v_prev is not None else np.zeros(3)
         if self.v_prev is not None and self.mpc_on:
             h_xy, h_z = (self.mpc_xy.h[: self.MPC_M], self.mpc_z.h[: self.MPC_M])
             u_h = self.u_hist
@@ -855,10 +808,7 @@ class XJIRacer(Controller):
         self.v_prev = vel.copy()
         if self.MPC and t >= self.T_MPC and (not self.mpc_on):
             self.mpc_on = True
-            sxy, sz = (
-                self.mpc_xy.h[: self.MPC_M].sum(),
-                self.mpc_z.h[: self.MPC_M].sum(),
-            )
+            sxy, sz = (self.mpc_xy.h[: self.MPC_M].sum(), self.mpc_z.h[: self.MPC_M].sum())
             self.u_hist[:] = a_now / np.array([sxy, sxy, sz])
         if self.mpc_on:
             ts = t + np.arange(1, self.MPC_N + 1) / self.freq
@@ -883,9 +833,7 @@ class XJIRacer(Controller):
                 if hz >= self.F_CLIP:
                     a_thr = np.array([0.0, 0.0, self.F_CLIP])
                 else:
-                    sc = math.sqrt(self.F_CLIP**2 - hz**2) / max(
-                        np.linalg.norm(a_thr[:2]), 1e-09
-                    )
+                    sc = math.sqrt(self.F_CLIP**2 - hz**2) / max(np.linalg.norm(a_thr[:2]), 1e-09)
                     a_thr[:2] *= sc
             u_applied = a_thr - self.C_DRAG * vel - GRAV * EZ
             p, v = (pos.copy(), vel.copy())
@@ -893,10 +841,7 @@ class XJIRacer(Controller):
         else:
             P, V, A = self._ref(np.array([t, t + self.TAU_A, t + self.TAU_Z]))
             p, v = (P[0], V[0])
-            a = np.r_[
-                A[1, :2] + self.C_DRAG[:2] * V[1, :2],
-                A[2, 2] + self.C_DRAG[2] * V[2, 2],
-            ]
+            a = np.r_[A[1, :2] + self.C_DRAG[:2] * V[1, :2], A[2, 2] + self.C_DRAG[2] * V[2, 2]]
             a_thr = self.ACC_GAIN * a + GRAV * EZ
             a_thr[2] = max(a_thr[2], 3.0)
             a_ff = a_thr / self.K_FF - GRAV * EZ
