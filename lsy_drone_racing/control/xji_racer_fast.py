@@ -1,4 +1,4 @@
-"""XJI Level 2 racer with an earlier launch and distance-blended gate tracking."""
+"""XJI Level 2 racer with tracking-aware trajectory timing."""
 
 from __future__ import annotations
 
@@ -6,11 +6,10 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
+from lsy_drone_racing.control import Controller
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
-
-from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -304,7 +303,7 @@ class _BlendRef:
 
 
 class XJIRacerAggro(Controller):
-    """Track a thrust-limited racing line with preview MPC."""
+    """Track a racing line with preview MPC and adaptive trajectory timing."""
 
     K_FF = 1.611 * 0.0393 / 0.0434
     C_DRAG = np.array([0.4987, 0.4987, 0.571])
@@ -327,7 +326,7 @@ class XJIRacerAggro(Controller):
     DS = 0.01
     DT = 0.01
     V_MAX = 5.0
-    F_MAX = 15.65
+    F_MAX = 14.0
     A_ACC = 10.0
     A_DEC = 10.0
     A_LAT = 13.0
@@ -336,18 +335,18 @@ class XJIRacerAggro(Controller):
     EB_IT = 4
     D_PIN = 0.12
     D_PIN_K = (0.2, 0.12, 0.25, 0.25, 0.12)
-    F_LEG = (15.15, 16.15, 15.65, 15.65, 15.65)
+    F_LEG = (13.75, 14.25, 14.0, 14.0, 14.0)
     J_MAX = 200.0
     T_BLEND = 0.12
     FADE = 0.8
     D_START_MIN = 0.3
-    D_APP = (0.44, 0.48, 0.48, 0.48, 0.48)
-    V_APP = (2.6, 3.0, 2.8, 2.8, 9.0)
+    D_APP = (0.75, 0.75, 0.8, 0.75, 0.48)
+    V_APP = (2.2, 2.5, 2.2, 2.3000000000000003, 9.0)
     V_FINAL = 9.0
     R_PATH = 0.2
     R_REPLAN = 0.17
     Z_OFF = 0.0
-    AIM_L = (-0.006, -0.011, -0.056, 0.032, 0.036)
+    AIM_L = (-0.015, 0.0, -0.035, 0.03, 0.0)
     AIM_Z = (0.0, 0.0, 0.0, 0.0, 0.0)
     CORR_DELAY = 0.0
     CORR_LAMBDA = 1.5
@@ -390,6 +389,7 @@ class XJIRacerAggro(Controller):
         super().__init__(obs, info, config)
         self.freq = config.env.freq
         self.tick = 0
+        self.clock_rate = 1.0
         self.finished = False
         self.mpc_on = False
         self.seq = np.asarray(obs["gate_sequence"], int)
@@ -798,6 +798,13 @@ class XJIRacerAggro(Controller):
     ) -> NDArray[np.floating]:
         """Compute the next desired state."""
         t = self.tick / self.freq
+        rp, rv, _ = self._ref(np.array([t]))
+        error = np.asarray(obs["pos"]) - rp[0]
+        speed = np.linalg.norm(rv[0])
+        lag = max(0.0, -error @ rv[0] / max(speed, 0.2))
+        cross = np.linalg.norm(error - (error @ rv[0]) * rv[0] / max(speed**2, 0.04))
+        rate = np.clip(1.0 - 1.5 * max(lag - 0.03, cross - 0.07, 0.0), 0.65, 1.0)
+        self.clock_rate += 0.2 * (rate - self.clock_rate)
         passed = int(obs["n_gates_passed"])
         g_seen = np.asarray(obs["gates_visited"], bool)
         o_seen = np.asarray(obs["obstacles_visited"], bool)
@@ -836,8 +843,10 @@ class XJIRacerAggro(Controller):
             sxy, sz = (self.mpc_xy.h[: self.MPC_M].sum(), self.mpc_z.h[: self.MPC_M].sum())
             self.u_hist[:] = a_now / np.array([sxy, sxy, sz])
         if self.mpc_on:
-            ts = t + np.arange(1, self.MPC_N + 1) / self.freq
+            ts = t + self.clock_rate * np.arange(1, self.MPC_N + 1) / self.freq
             P, V, A = self._ref(np.r_[t, ts])
+            V *= self.clock_rate
+            A *= self.clock_rate**2
             u = np.zeros(3)
             gate_weight = 0.0
             if self.passed < self.n_pass and self.g_seen[self.seq[self.passed]]:
@@ -910,12 +919,13 @@ class XJIRacerAggro(Controller):
         info: dict,
     ) -> bool:
         """Advance the clock."""
-        self.tick += 1
+        self.tick += self.clock_rate
         return self.finished
 
     def episode_callback(self):
         """Reset the clock."""
         self.tick = 0
+        self.clock_rate = 1.0
 
     def render_callback(self, sim: Sim):
         """Draw the planned path."""
