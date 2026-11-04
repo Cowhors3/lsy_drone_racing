@@ -341,7 +341,7 @@ class XJIRacerAggro(Controller):
     T_BLEND = 0.12
     FADE = 0.8
     D_START_MIN = 0.3
-    D_APP = 0.75
+    D_APP = 0.48
     V_APP = (2.6, 3.0, 2.8, 2.8, 9.0)
     V_FINAL = 9.0
     R_PATH = 0.2
@@ -839,7 +839,7 @@ class XJIRacerAggro(Controller):
             if self.passed < self.n_pass and self.g_seen[self.seq[self.passed]]:
                 center = self.gpos[self.seq[self.passed]]
                 distance = np.linalg.norm(pos - center)
-                gate_weight = float(_smooth5((1.0 - distance) / 0.75)[0])
+                gate_weight = float(_smooth5((1.15 - distance) / 0.85)[0])
             for ax in range(3):
                 mpc = self.mpc_z if ax == 2 else self.mpc_xy
                 u[ax] = mpc.solve(
