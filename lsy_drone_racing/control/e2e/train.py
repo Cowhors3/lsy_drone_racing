@@ -12,6 +12,16 @@ The file is organised as:
 Run from the repository root:
 
     python -m lsy_drone_racing.control.e2e.train --config level2.toml
+
+A faster policy, saved next to the default one:
+
+    python -m lsy_drone_racing.control.e2e.train --max_speed 3.0 --time_penalty 0.02 \
+        --drone_radius 0.08 --out policy_fast.npz
+
+Continue training saved weights with different settings (``--max_tilt`` must stay the same):
+
+    python -m lsy_drone_racing.control.e2e.train --init policy_fast.npz --time_penalty 0.03 \
+        --max_speed 3.0 --drone_radius 0.08 --out policy_fast2.npz
 """
 
 from __future__ import annotations
@@ -97,18 +107,42 @@ def log_prob(params: dict, obs: Array, action: Array) -> Array:
     return jnp.sum(-0.5 * z**2 - params["log_std"] - 0.5 * jnp.log(2 * jnp.pi), axis=-1)
 
 
-def save_policy(params: dict, path: Path = POLICY_PATH):
-    """Save the actor weights. The critic is only needed during training."""
-    arrays = {}
-    for i, (w, b) in enumerate(params["actor"]):
-        arrays[f"w{i}"], arrays[f"b{i}"] = np.asarray(w), np.asarray(b)
+def save_policy(params: dict, max_tilt: float, path: Path = POLICY_PATH):
+    """Save the weights together with the tilt limit they were trained for.
+
+    The controller only needs the actor (``w*``, ``b*``) and ``max_tilt``. The critic (``cw*``,
+    ``cb*``) and the noise level are stored so that training can be continued with ``--init``.
+    """
+    arrays = {"max_tilt": np.float32(max_tilt), "log_std": np.asarray(params["log_std"])}
+    for name, prefix in (("actor", ""), ("critic", "c")):
+        for i, (w, b) in enumerate(params[name]):
+            arrays[f"{prefix}w{i}"], arrays[f"{prefix}b{i}"] = np.asarray(w), np.asarray(b)
     np.savez(path, **arrays)
 
 
-def load_policy(path: Path = POLICY_PATH) -> list[tuple[Array, Array]]:
-    """Load actor weights saved by ``save_policy``."""
-    data = np.load(path)
-    return [(jnp.asarray(data[f"w{i}"]), jnp.asarray(data[f"b{i}"])) for i in range(len(data) // 2)]
+def read_layers(data: dict, prefix: str = "") -> list[tuple[Array, Array]]:
+    """Collect the (weight, bias) pairs of one network from a saved file."""
+    n = sum(key.startswith(f"{prefix}w") for key in data)
+    return [
+        (jnp.asarray(data[f"{prefix}w{i}"]), jnp.asarray(data[f"{prefix}b{i}"])) for i in range(n)
+    ]
+
+
+def load_policy(path: Path = POLICY_PATH) -> tuple[list[tuple[Array, Array]], float]:
+    """Load the actor and its tilt limit (the default for files saved before it was stored)."""
+    data = dict(np.load(path))
+    return read_layers(data), float(data.get("max_tilt", env.MAX_TILT))
+
+
+def load_params(path: Path, params: dict, max_tilt: float) -> dict:
+    """Replace freshly initialized parameters by saved ones to continue a training run."""
+    data = dict(np.load(path))
+    saved_tilt = float(data.get("max_tilt", env.MAX_TILT))
+    assert abs(saved_tilt - max_tilt) < 1e-6, f"{path.name} needs --max_tilt {saved_tilt:.2f}"
+    params = params | {"actor": read_layers(data)}
+    if "log_std" in data:  # Older files hold only the actor, the critic then starts from scratch
+        params |= {"critic": read_layers(data, "c"), "log_std": jnp.asarray(data["log_std"])}
+    return params
 
 
 # region 3. Rollout
@@ -176,9 +210,12 @@ def make_update(track: env.Track, cfg: Config, optimizer: optax.GradientTransfor
     """Build the compiled function that does one rollout followed by one PPO update."""
 
     @jax.jit
-    def update(params: dict, opt_state: optax.OptState, states: env.State, key: Array) -> tuple:
+    def update(
+        params: dict, opt_state: optax.OptState, states: env.State, key: Array, time_penalty: Array
+    ) -> tuple:
         k_rollout, k_shuffle = jax.random.split(key)
-        states, batch, last_value, info = rollout(params, states, k_rollout, track, cfg)
+        current = track._replace(time_penalty=time_penalty)
+        states, batch, last_value, info = rollout(params, states, k_rollout, current, cfg)
         adv, returns = advantages(batch, last_value, cfg)
         # Flatten (n_steps, n_envs, ...) to (n_samples, ...) for minibatch sampling
         data = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), (batch, adv, returns))
@@ -213,15 +250,55 @@ def make_update(track: env.Track, cfg: Config, optimizer: optax.GradientTransfor
 # region 5. Training loop
 
 
-def train(config: str = "level2.toml", **overrides: int | float):
-    """Train a racing policy and save it to ``policy.npz``.
+def train(
+    config: str = "level2.toml",
+    max_speed: float = env.MAX_SPEED,
+    time_penalty: float = env.R_TIME,
+    drone_radius: float = env.DRONE_RADIUS,
+    max_tilt: float = env.MAX_TILT,
+    spin_penalty: float = env.R_SPIN,
+    thrust_range: float = env.THRUST_SCALE_RANGE,
+    max_delay: int = env.MAX_DELAY_STEPS,
+    init: str | None = None,
+    out: str = POLICY_PATH.name,
+    **overrides: int | float,
+):
+    """Train a racing policy and save its weights.
 
     Args:
         config: Level file in ``config/`` that defines the track.
+        max_speed: Speed limit in m/s. Only a ceiling, it does not make the policy hurry.
+        time_penalty: Reward lost per step. Higher values give faster laps and more crashes.
+            It rises from the default to this value during the first half of training. A policy
+            that is hurried from the start never learns to finish the track. With ``init`` the
+            policy can already fly, so the value applies from the first step.
+        drone_radius: Collision size of the drone in m. Smaller values leave less safety margin
+            around gates and poles, which lets the policy fly tighter and faster lines.
+        max_tilt: Largest roll and pitch command in rad. More tilt gives sharper turns and a
+            more aggressive flight. The value is stored in the weights file.
+        spin_penalty: Reward lost per (rad/s)^2 of roll and pitch rate. Lower values allow
+            quick turns, at the cost of a less smooth flight.
+        thrust_range: The thrust is randomized by up to this fraction, 0.15 means +-15 %.
+        max_delay: Commands are randomly delayed by 0 to this many control steps of 20 ms.
+            Both make the policy tolerate a real drone that differs from the simulation.
+        init: File name of saved weights in ``control/e2e/`` to continue from, instead of
+            starting with a random network.
+        out: File name of the saved weights inside ``control/e2e/``. The controller flies
+            ``policy.npz``, so other names can be trained and compared without replacing it.
         overrides: Any field of ``Config``, e.g. ``--total_steps 5e7 --n_envs 4096``.
     """
     cfg = Config()._replace(**{k: type(getattr(Config(), k))(v) for k, v in overrides.items()})
-    track = env.load_track(config)
+    track = env.load_track(
+        config,
+        max_speed,
+        time_penalty,
+        drone_radius,
+        max_tilt,
+        spin_penalty,
+        thrust_range,
+        max_delay,
+    )
+    path = POLICY_PATH.parent / out
     n_updates = cfg.total_steps // (cfg.n_envs * cfg.n_steps)
     schedule = optax.linear_schedule(
         cfg.learning_rate, 0.0, n_updates * cfg.epochs * cfg.minibatches
@@ -232,26 +309,36 @@ def train(config: str = "level2.toml", **overrides: int | float):
 
     key, k_params, k_envs = jax.random.split(jax.random.key(cfg.seed), 3)
     params = init_params(k_params, cfg)
+    if init is not None:
+        params = load_params(POLICY_PATH.parent / init, params, max_tilt)
     opt_state = optimizer.init(params)
     states = jax.vmap(env.reset, (0, None))(jax.random.split(k_envs, cfg.n_envs), track)
     update = make_update(track, cfg, optimizer)
 
     batch_size = cfg.n_envs * cfg.n_steps
     print(f"Training on {jax.devices()[0]}: {n_updates} updates of {batch_size} steps")
+    print(
+        f"Speed limit {max_speed} m/s, time penalty {time_penalty}, drone radius {drone_radius} m, "
+        f"tilt limit {max_tilt} rad, spin penalty {spin_penalty}, thrust +-{thrust_range:.0%}, "
+        f"delay up to {20 * max_delay} ms, start from {init or 'scratch'}, "
+        f"saving to {path.name}"
+    )
     start = time.time()
     for i in range(1, n_updates + 1):
         key, k_update = jax.random.split(key)
-        params, opt_state, states, stats = update(params, opt_state, states, k_update)
+        ramp = 1.0 if init else min(1.0, 2 * i / n_updates)  # 0 -> 1 over the first half
+        penalty = env.R_TIME + ramp * (time_penalty - env.R_TIME)
+        params, opt_state, states, stats = update(params, opt_state, states, k_update, penalty)
         if i % 10 == 0 or i == n_updates:
             steps = i * batch_size
             print(
                 f"{steps / 1e6:7.1f}M steps | {steps / (time.time() - start):8.0f} steps/s | "
                 f"reward {stats['reward']:6.3f} | gates {stats['gates']:4.2f} | "
                 f"crash {stats['crash']:4.2f} | finish {stats['finish']:4.2f} | "
-                f"std {stats['std']:4.2f}"
+                f"std {stats['std']:4.2f} | time penalty {penalty:5.3f}"
             )
-            save_policy(params)
-    print(f"Done in {time.time() - start:.0f} s. Policy saved to {POLICY_PATH}")
+            save_policy(params, max_tilt, path)
+    print(f"Done in {time.time() - start:.0f} s. Policy saved to {path}")
 
 
 if __name__ == "__main__":

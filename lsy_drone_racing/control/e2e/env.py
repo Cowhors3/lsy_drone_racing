@@ -37,11 +37,13 @@ TAKEOFF_STEPS = 25  # Touching the floor is allowed during the first 0.5 s
 
 # Action: the policy outputs 3 numbers in [-1, 1] -> roll, pitch, collective thrust. Yaw stays 0.
 ACTION_DIM = 3
-MAX_TILT = 0.6  # rad, roll and pitch limit
+MAX_TILT = 0.6  # rad, default roll and pitch limit. Train with ``--max_tilt`` for sharper turns
 N_ACTION_HISTORY = 2  # Past actions in the observation, lets the policy cope with delay
 
 # Geometry of the course hardware (see envs/assets/gate.xml and obstacle.xml)
-DRONE_RADIUS = 0.10  # Drone approximated as a sphere, larger than the real frame for margin
+# Drone approximated as a sphere. The simulator uses a 0.14 m wide box, so 0.10 leaves 3 cm of
+# margin on each side. Train with ``--drone_radius`` to trade this margin for speed.
+DRONE_RADIUS = 0.10
 GATE_OPENING = 0.2  # Half width of the square opening
 GATE_OUTER = 0.36  # Half width of the gate frame
 GATE_DEPTH = 0.01  # Half thickness of the gate frame
@@ -54,20 +56,21 @@ AIM_MAX_DISTANCE = 0.6  # How far in front of a gate the reward may place its ai
 R_PROGRESS = 1.0  # Per meter of approach to the next gate
 R_GATE = 3.0  # Bonus for passing a gate
 R_CRASH = -2.0
-R_TIME = 0.01  # Penalty per step, hovering in place must not pay off
+R_TIME = 0.01  # Default penalty per step. Train with ``--time_penalty`` to push for lap time
 R_ACTION_RATE = 0.01  # Penalty on action changes, keeps commands smooth for the real drone
-R_SPIN = 0.002  # Penalty on roll and pitch rates
+R_SPIN = 0.002  # Default penalty on roll and pitch rates, ``--spin_penalty`` allows quick turns
 R_SPEED = 0.2  # Penalty on flying faster than MAX_SPEED
-MAX_SPEED = 2.0  # m/s, raise this for faster laps once the real drone flies reliably
+MAX_SPEED = 2.0  # m/s, default speed limit. Train with ``--max_speed`` for faster laps
 
 # Domain randomization, makes the policy robust to the differences between simulation and the
 # real drone. Each value is redrawn for every episode.
 MASS_RANGE = 0.005  # kg, +-
-THRUST_SCALE_RANGE = 0.15  # +-15 % thrust, covers battery level and motor wear
+THRUST_SCALE_RANGE = 0.15  # Default +-15 % thrust, covers battery level and motor wear
 RPY_GAIN_RANGE = 0.20  # +-20 % strength of the onboard attitude response
 RPY_BIAS_RANGE = 0.03  # rad, constant roll and pitch offset of the real drone
 START_YAW_RANGE = 0.2  # rad, the drone is never placed perfectly straight
-MAX_DELAY_STEPS = 2  # Commands arrive 0, 1 or 2 control steps late (0 to 40 ms)
+MAX_DELAY_STEPS = 2  # By default commands arrive 0, 1 or 2 control steps late (0 to 40 ms)
+DELAY_BUFFER = 4  # Longest delay the environment can simulate, in control steps
 
 # Measurement noise (standard deviation), redrawn at every step
 POS_NOISE = 0.003  # m, motion capture
@@ -96,6 +99,13 @@ class Track(NamedTuple):
     gate_pos_noise: Array  # (3,)
     gate_rpy_noise: Array  # (3,)
     obstacle_noise: Array  # (3,)
+    max_speed: Array  # m/s, flying faster than this is penalized
+    time_penalty: Array  # Reward lost per step, the only term that rewards a short lap time
+    drone_radius: Array  # m, collision size of the drone during training
+    max_tilt: Array  # rad, roll and pitch command at the action limit
+    spin_penalty: Array  # Reward lost per (rad/s)^2 of roll and pitch rate
+    thrust_range: Array  # Thrust of the real drone differs by up to this fraction
+    max_delay: Array  # Commands arrive up to this many control steps late
     # Drone model
     mass: Array
     thrust_low: Array  # N, total thrust limits
@@ -108,7 +118,17 @@ class Track(NamedTuple):
     cmd_rpy_coef: Array  # (3,)
 
 
-def load_track(config: str = "level2.toml", drone: str = "cf21B_500") -> Track:
+def load_track(
+    config: str = "level2.toml",
+    max_speed: float = MAX_SPEED,
+    time_penalty: float = R_TIME,
+    drone_radius: float = DRONE_RADIUS,
+    max_tilt: float = MAX_TILT,
+    spin_penalty: float = R_SPIN,
+    thrust_range: float = THRUST_SCALE_RANGE,
+    max_delay: int = MAX_DELAY_STEPS,
+    drone: str = "cf21B_500",
+) -> Track:
     """Load the nominal track and the drone parameters."""
     cfg = toml.load(Path(__file__).parents[3] / "config" / config)["env"]
     track, noise = cfg["track"], cfg["randomizations"]
@@ -128,6 +148,13 @@ def load_track(config: str = "level2.toml", drone: str = "cf21B_500") -> Track:
         gate_pos_noise=f32(noise["gate_pos"]["kwargs"]["maxval"]),
         gate_rpy_noise=f32(noise["gate_rpy"]["kwargs"]["maxval"]),
         obstacle_noise=f32(noise["obstacle_pos"]["kwargs"]["maxval"]),
+        max_speed=f32(max_speed),
+        time_penalty=f32(time_penalty),
+        drone_radius=f32(drone_radius),
+        max_tilt=f32(max_tilt),
+        spin_penalty=f32(spin_penalty),
+        thrust_range=f32(thrust_range),
+        max_delay=jnp.asarray(min(max_delay, DELAY_BUFFER)),
         mass=f32(p["mass"]),
         thrust_low=f32(4 * p["thrust_min"]),
         thrust_high=f32(4 * p["thrust_max"]),
@@ -152,7 +179,7 @@ class State(NamedTuple):
     rpy: Array  # (3,)
     rpy_rates: Array  # (3,)
     thrust: Array  # Current total thrust in N, lags behind the command
-    actions: Array  # (1 + MAX_DELAY_STEPS, 3) most recent policy actions, newest first
+    actions: Array  # (1 + DELAY_BUFFER, 3) most recent policy actions, newest first
     # Race progress
     target: Array  # Index into the gate sequence of the next gate to pass
     step: Array
@@ -174,11 +201,13 @@ class State(NamedTuple):
 # region 4. Dynamics
 
 
-def action_to_command(action: Array, thrust_low: Array, thrust_high: Array) -> Array:
+def action_to_command(
+    action: Array, thrust_low: Array, thrust_high: Array, max_tilt: Array | float
+) -> Array:
     """Map a policy action in [-1, 1] to the attitude command [roll, pitch, yaw, thrust]."""
     action = jnp.clip(action, -1.0, 1.0)
     thrust = thrust_low + (action[2] + 1) / 2 * (thrust_high - thrust_low)
-    return jnp.array([action[0] * MAX_TILT, action[1] * MAX_TILT, 0.0, thrust])
+    return jnp.array([action[0] * max_tilt, action[1] * max_tilt, 0.0, thrust])
 
 
 def simulate(state: State, command: Array, track: Track) -> State:
@@ -236,11 +265,11 @@ def check_gates(last_pos: Array, pos: Array, state: State, track: Track) -> tupl
     yz = last[:, 1:] + alpha[:, None] * (now[:, 1:] - last[:, 1:])
     offset = jnp.max(jnp.abs(yz), axis=-1)  # Distance from the gate center line, square norm
 
-    in_opening = offset < GATE_OPENING - DRONE_RADIUS
-    in_frame = ~in_opening & (offset < GATE_OUTER + DRONE_RADIUS)
-    at_plane = crossed | (jnp.abs(now[:, 0]) < GATE_DEPTH + DRONE_RADIUS)
+    in_opening = offset < GATE_OPENING - track.drone_radius
+    in_frame = ~in_opening & (offset < GATE_OUTER + track.drone_radius)
+    at_plane = crossed | (jnp.abs(now[:, 0]) < GATE_DEPTH + track.drone_radius)
     hit_frame = at_plane & in_frame
-    reach = STAND_HALF_WIDTH + DRONE_RADIUS
+    reach = STAND_HALF_WIDTH + track.drone_radius
     hit_stand = (
         (jnp.abs(now[:, 0]) < reach) & (jnp.abs(now[:, 1]) < reach) & (now[:, 2] < -GATE_OUTER)
     )
@@ -251,11 +280,11 @@ def check_gates(last_pos: Array, pos: Array, state: State, track: Track) -> tupl
     return passed, jnp.any(hit_frame | hit_stand)
 
 
-def check_obstacles(pos: Array, state: State) -> Array:
+def check_obstacles(pos: Array, state: State, track: Track) -> Array:
     """True if the drone touches one of the vertical poles."""
     dist = jnp.linalg.norm(pos[:2] - state.obstacles_pos[:, :2], axis=-1)
-    below_top = pos[2] < state.obstacles_pos[:, 2] + DRONE_RADIUS
-    return jnp.any((dist < POLE_RADIUS + DRONE_RADIUS) & below_top)
+    below_top = pos[2] < state.obstacles_pos[:, 2] + track.drone_radius
+    return jnp.any((dist < POLE_RADIUS + track.drone_radius) & below_top)
 
 
 def approach_distance(pos: Array, gate_pos: Array, gate_quat: Array, direction: Array) -> Array:
@@ -381,7 +410,8 @@ def reset(key: Array, track: Track) -> State:
     exit_dir = exit_dir * track.gate_direction[target - 1]
     behind = 0.25 + uniform(keys[6], 0.15)  # Distance already flown past the previous gate
     air_pos = gates_pos[prev_gate] + behind * exit_dir + uniform(keys[7], 0.08, (3,))
-    air_vel = (0.5 + uniform(keys[8], 0.5)) * MAX_SPEED * exit_dir + uniform(keys[9], 0.5, (3,))
+    air_speed = (0.5 + uniform(keys[8], 0.5)) * track.max_speed
+    air_vel = air_speed * exit_dir + uniform(keys[9], 0.5, (3,))
     on_pad = target == 0
     pos = jnp.where(on_pad, pad_pos, air_pos)
     vel = jnp.where(on_pad, jnp.zeros(3), air_vel)
@@ -393,7 +423,7 @@ def reset(key: Array, track: Track) -> State:
         rpy=jnp.array([0.0, 0.0, 1.0]) * uniform(keys[14], START_YAW_RANGE),
         rpy_rates=jnp.zeros(3),
         thrust=jnp.where(on_pad, track.thrust_low, mass * 9.81),
-        actions=jnp.zeros((1 + MAX_DELAY_STEPS, ACTION_DIM)),
+        actions=jnp.zeros((1 + DELAY_BUFFER, ACTION_DIM)),
         target=target,
         step=jnp.zeros((), dtype=jnp.int32),
         gates_pos=gates_pos,
@@ -402,10 +432,10 @@ def reset(key: Array, track: Track) -> State:
         gates_seen=jnp.zeros(track.gates_pos.shape[0], dtype=bool),
         obstacles_seen=jnp.zeros(track.obstacles_pos.shape[0], dtype=bool),
         mass=mass,
-        thrust_scale=1.0 + uniform(keys[11], THRUST_SCALE_RANGE),
+        thrust_scale=1.0 + uniform(keys[11], track.thrust_range),
         rpy_gain=1.0 + uniform(keys[15], RPY_GAIN_RANGE),
         rpy_bias=jnp.array([1.0, 1.0, 0.0]) * uniform(keys[16], RPY_BIAS_RANGE, (3,)),
-        delay=jax.random.randint(keys[12], (), 0, MAX_DELAY_STEPS + 1),
+        delay=jax.random.randint(keys[12], (), 0, track.max_delay + 1),
         key=keys[13],
     )
     return update_seen(state, track)
@@ -421,14 +451,16 @@ def step(state: State, action: Array, track: Track) -> tuple[State, Array, Array
     # 1) Move the drone. The command that reaches the drone may be a few steps old.
     action = jnp.clip(action, -1.0, 1.0)
     actions = jnp.concatenate([action[None], state.actions[:-1]])
-    command = action_to_command(actions[state.delay], track.thrust_low, track.thrust_high)
+    command = action_to_command(
+        actions[state.delay], track.thrust_low, track.thrust_high, track.max_tilt
+    )
     moved = simulate(state, command, track)
 
     # 2) Check what happened during this step
     passed, hit_gate = check_gates(state.pos, moved.pos, state, track)
     out_of_bounds = jnp.any((moved.pos < track.pos_low) | (moved.pos > track.pos_high))
     out_of_bounds |= (moved.pos[2] <= 0.0) & (state.step > TAKEOFF_STEPS)  # Landed outside takeoff
-    crashed = hit_gate | check_obstacles(moved.pos, state) | out_of_bounds
+    crashed = hit_gate | check_obstacles(moved.pos, state, track) | out_of_bounds
     target = state.target + passed
     finished = target >= track.gate_sequence.shape[0]
     timeout = state.step + 1 >= MAX_STEPS
@@ -448,10 +480,10 @@ def step(state: State, action: Array, track: Track) -> tuple[State, Array, Array
         R_PROGRESS * progress
         + R_GATE * passed
         + R_CRASH * crashed
-        - R_TIME
+        - track.time_penalty
         - R_ACTION_RATE * jnp.sum((action - state.actions[0]) ** 2)
-        - R_SPIN * jnp.sum(moved.rpy_rates[:2] ** 2)
-        - R_SPEED * jnp.maximum(jnp.linalg.norm(moved.vel) - MAX_SPEED, 0.0) ** 2
+        - track.spin_penalty * jnp.sum(moved.rpy_rates[:2] ** 2)
+        - R_SPEED * jnp.maximum(jnp.linalg.norm(moved.vel) - track.max_speed, 0.0) ** 2
     )
 
     # 4) Continue the episode, or start a new one if it ended

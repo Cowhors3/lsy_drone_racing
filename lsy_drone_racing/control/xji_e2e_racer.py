@@ -7,10 +7,14 @@ Each control step does three things:
 3. Convert the network output to an attitude command [roll, pitch, yaw, thrust].
 
 Requires ``control_mode = "attitude"`` in the level config.
+
+Flies ``e2e/policy.npz`` by default. To try other weights without replacing that file, set the
+environment variable ``E2E_POLICY``, e.g. ``E2E_POLICY=policy_fast.npz python scripts/sim.py``.
 """
 
 from __future__ import annotations  # Python 3.10 type hints
 
+import os
 from typing import TYPE_CHECKING
 
 import jax
@@ -21,7 +25,7 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.e2e import env
-from lsy_drone_racing.control.e2e.train import load_policy, policy_mean
+from lsy_drone_racing.control.e2e.train import POLICY_PATH, load_policy, policy_mean
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -44,7 +48,8 @@ class E2ERacer(Controller):
         self._thrust_high = 4 * params["thrust_max"]
         self._last_actions = np.zeros((env.N_ACTION_HISTORY, env.ACTION_DIM), dtype=np.float32)
 
-        actor = load_policy()
+        policy_file = os.environ.get("E2E_POLICY", POLICY_PATH.name)
+        actor, self._max_tilt = load_policy(POLICY_PATH.with_name(policy_file))
 
         @jax.jit
         def act(*observation: jax.Array) -> jax.Array:
@@ -82,7 +87,9 @@ class E2ERacer(Controller):
         )
         self._last_actions = np.roll(self._last_actions, 1, axis=0)
         self._last_actions[0] = action
-        command = env.action_to_command(jnp.asarray(action), self._thrust_low, self._thrust_high)
+        command = env.action_to_command(
+            jnp.asarray(action), self._thrust_low, self._thrust_high, self._max_tilt
+        )
         return np.asarray(command, dtype=np.float32)
 
     def step_callback(
