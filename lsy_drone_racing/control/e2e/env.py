@@ -51,6 +51,7 @@ STAND_HALF_WIDTH = 0.05  # The stand is a square post below the frame
 POLE_RADIUS = 0.015
 N_GATES_AHEAD = 2  # The policy sees the next two gates
 AIM_MAX_DISTANCE = 0.6  # How far in front of a gate the reward may place its aim point
+DETOUR_CLEARANCE = 0.2  # Distance kept from the frame of the gate just passed when going around it
 
 # Reward weights
 R_PROGRESS = 1.0  # Per meter of approach to the next gate
@@ -67,7 +68,7 @@ MAX_SPEED = 2.0  # m/s, default speed limit. Train with ``--max_speed`` for fast
 MASS_RANGE = 0.005  # kg, +-
 THRUST_SCALE_RANGE = 0.15  # Default +-15 % thrust, covers battery level and motor wear
 RPY_GAIN_RANGE = 0.20  # +-20 % strength of the onboard attitude response
-RPY_BIAS_RANGE = 0.03  # rad, constant roll and pitch offset of the real drone
+RPY_BIAS_RANGE = 0.03  # rad, default constant roll and pitch offset of the real drone
 START_YAW_RANGE = 0.2  # rad, the drone is never placed perfectly straight
 MAX_DELAY_STEPS = 2  # By default commands arrive 0, 1 or 2 control steps late (0 to 40 ms)
 DELAY_BUFFER = 4  # Longest delay the environment can simulate, in control steps
@@ -105,6 +106,7 @@ class Track(NamedTuple):
     max_tilt: Array  # rad, roll and pitch command at the action limit
     spin_penalty: Array  # Reward lost per (rad/s)^2 of roll and pitch rate
     thrust_range: Array  # Thrust of the real drone differs by up to this fraction
+    bias_range: Array  # rad, the real drone holds roll and pitch with up to this offset
     max_delay: Array  # Commands arrive up to this many control steps late
     # Drone model
     mass: Array
@@ -126,6 +128,7 @@ def load_track(
     max_tilt: float = MAX_TILT,
     spin_penalty: float = R_SPIN,
     thrust_range: float = THRUST_SCALE_RANGE,
+    bias_range: float = RPY_BIAS_RANGE,
     max_delay: int = MAX_DELAY_STEPS,
     drone: str = "cf21B_500",
 ) -> Track:
@@ -154,6 +157,7 @@ def load_track(
         max_tilt=f32(max_tilt),
         spin_penalty=f32(spin_penalty),
         thrust_range=f32(thrust_range),
+        bias_range=f32(bias_range),
         max_delay=jnp.asarray(min(max_delay, DELAY_BUFFER)),
         mass=f32(p["mass"]),
         thrust_low=f32(4 * p["thrust_min"]),
@@ -298,19 +302,42 @@ def check_obstacles(pos: Array, state: State, track: Track) -> Array:
     return jnp.any((dist < POLE_RADIUS + track.drone_radius) & below_top)
 
 
-def approach_distance(pos: Array, gate_pos: Array, gate_quat: Array, direction: Array) -> Array:
-    """Distance to an aim point that guides the drone to the front of the gate.
+def approach_distance(
+    pos: Array,
+    gate_pos: Array,
+    gate_quat: Array,
+    direction: Array,
+    last_gate_pos: Array,
+    last_gate_quat: Array,
+    has_last_gate: Array,
+) -> Array:
+    """Length of the way to an aim point that guides the drone to the front of the next gate.
 
     Flying straight at the gate center would pull a drone that is beside or behind the gate into
     the frame. The aim point therefore sits in front of the gate, further out the more the drone
     is off the gate axis, and moves into the gate center as the drone lines up.
+
+    The way is measured around the gate the drone has just passed. If the straight line to the
+    aim point goes back through that gate, the way leads over the top of its frame instead.
     """
     local = Rotation.from_quat(gate_quat).apply(pos - gate_pos, inverse=True)
     along = local[0] * direction  # Negative in front of the gate, positive behind it
     off_axis = jnp.linalg.norm(local[1:]) + 2.0 * jnp.maximum(along, 0.0)
     normal = Rotation.from_quat(gate_quat).as_matrix()[:, 0] * direction
     aim = gate_pos - normal * jnp.minimum(off_axis, AIM_MAX_DISTANCE)
-    return jnp.linalg.norm(aim - pos)
+
+    # Does the straight line cross the plane of the last gate inside its frame?
+    last_rot = Rotation.from_quat(last_gate_quat)
+    a = last_rot.apply(pos - last_gate_pos, inverse=True)
+    b = last_rot.apply(aim - last_gate_pos, inverse=True)
+    crosses = a[0] * b[0] < 0
+    hit = a + jnp.where(crosses, a[0] / (a[0] - b[0]), 0.0) * (b - a)
+    top = GATE_OUTER + DETOUR_CLEARANCE
+    blocked = has_last_gate & crosses & (jnp.max(jnp.abs(hit[1:])) < top)
+    # Detour point above the frame, on the side of the gate where the drone currently is
+    via = jnp.array([jnp.sign(a[0]) * DETOUR_CLEARANCE, hit[1], top])
+    detour = jnp.linalg.norm(via - a) + jnp.linalg.norm(b - via)
+    return jnp.where(blocked, detour, jnp.linalg.norm(aim - pos))
 
 
 # region 6. Observation
@@ -445,7 +472,7 @@ def reset(key: Array, track: Track) -> State:
         mass=mass,
         thrust_scale=1.0 + uniform(keys[11], track.thrust_range),
         rpy_gain=1.0 + uniform(keys[15], RPY_GAIN_RANGE),
-        rpy_bias=jnp.array([1.0, 1.0, 0.0]) * uniform(keys[16], RPY_BIAS_RANGE, (3,)),
+        rpy_bias=jnp.array([1.0, 1.0, 0.0]) * uniform(keys[16], track.bias_range, (3,)),
         delay=jax.random.randint(keys[12], (), 0, track.max_delay + 1),
         key=keys[13],
     )
@@ -480,11 +507,15 @@ def step(state: State, action: Array, track: Track) -> tuple[State, Array, Array
     # 3) Reward: approach the next gate from its front, pass it, stay smooth, do not crash
     gate = track.gate_sequence[state.target]
     direction = track.gate_direction[state.target]
+    last_gate = track.gate_sequence[jnp.maximum(state.target - 1, 0)]
     distance = partial(
         approach_distance,
         gate_pos=state.gates_pos[gate],
         gate_quat=state.gates_quat[gate],
         direction=direction,
+        last_gate_pos=state.gates_pos[last_gate],
+        last_gate_quat=state.gates_quat[last_gate],
+        has_last_gate=(state.target > 0) & (last_gate != gate),
     )
     progress = distance(state.pos) - distance(moved.pos)
     reward = (

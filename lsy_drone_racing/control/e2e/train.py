@@ -258,6 +258,7 @@ def train(
     max_tilt: float = env.MAX_TILT,
     spin_penalty: float = env.R_SPIN,
     thrust_range: float = env.THRUST_SCALE_RANGE,
+    bias_range: float = env.RPY_BIAS_RANGE,
     max_delay: int = env.MAX_DELAY_STEPS,
     init: str | None = None,
     out: str = POLICY_PATH.name,
@@ -279,6 +280,8 @@ def train(
         spin_penalty: Reward lost per (rad/s)^2 of roll and pitch rate. Lower values allow
             quick turns, at the cost of a less smooth flight.
         thrust_range: The thrust is randomized by up to this fraction, 0.15 means +-15 %.
+        bias_range: Roll and pitch are held with a constant random offset of up to this many
+            rad, like a real drone that is not perfectly trimmed.
         max_delay: Commands are randomly delayed by 0 to this many control steps of 20 ms.
             Both make the policy tolerate a real drone that differs from the simulation.
         init: File name of saved weights in ``control/e2e/`` to continue from, instead of
@@ -296,6 +299,7 @@ def train(
         max_tilt,
         spin_penalty,
         thrust_range,
+        bias_range,
         max_delay,
     )
     path = POLICY_PATH.parent / out
@@ -320,7 +324,8 @@ def train(
     print(
         f"Speed limit {max_speed} m/s, time penalty {time_penalty}, drone radius {drone_radius} m, "
         f"tilt limit {max_tilt} rad, spin penalty {spin_penalty}, thrust +-{thrust_range:.0%}, "
-        f"delay up to {20 * max_delay} ms, start from {init or 'scratch'}, "
+        f"attitude bias +-{bias_range} rad, delay up to {20 * max_delay} ms, "
+        f"start from {init or 'scratch'}, "
         f"saving to {path.name}"
     )
     start = time.time()
