@@ -255,7 +255,8 @@ def check_gates(last_pos: Array, pos: Array, state: State, track: Track) -> tupl
 
     Returns:
         passed: True if the drone flew through its target gate in the right direction.
-        crashed: True if the drone touched any gate frame or stand.
+        crashed: True if the drone touched any gate frame or stand, or backed out of the gate it
+            has just passed.
     """
     last = to_gate_frames(last_pos, state.gates_pos, state.gates_quat)  # (G, 3)
     now = to_gate_frames(pos, state.gates_pos, state.gates_quat)
@@ -277,7 +278,17 @@ def check_gates(last_pos: Array, pos: Array, state: State, track: Track) -> tupl
     gate = track.gate_sequence[state.target]
     right_way = (now[gate, 0] - last[gate, 0]) * track.gate_direction[state.target] > 0
     passed = crossed[gate] & in_opening[gate] & right_way
-    return passed, jnp.any(hit_frame | hit_stand)
+
+    # A pass only needs the drone center to cross the gate plane. Without this rule the policy
+    # learns to dip a few centimeters into a gate and reverse out of it when the next gate lies
+    # behind it. Coming back through the opening of the gate just passed therefore ends the
+    # episode, so the drone has to fly through completely and go around the frame.
+    last_pass = jnp.maximum(state.target - 1, 0)
+    last_gate = track.gate_sequence[last_pass]
+    came_back = (now[last_gate, 0] - last[last_gate, 0]) * track.gate_direction[last_pass] < 0
+    backed_out = crossed[last_gate] & in_opening[last_gate] & came_back
+    backed_out &= (state.target > 0) & (last_gate != gate)  # The same gate may be the next target
+    return passed, jnp.any(hit_frame | hit_stand) | backed_out
 
 
 def check_obstacles(pos: Array, state: State, track: Track) -> Array:
